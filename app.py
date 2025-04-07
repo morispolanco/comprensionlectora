@@ -6,7 +6,6 @@ import os
 import time
 import pandas as pd
 import logging
-import pickle
 import shutil
 from datetime import datetime
 
@@ -18,7 +17,6 @@ CONFIG = {
     "MAX_RETRIES": 3,
     "WORD_RANGES": {2: "50-80", 4: "80-120", 6: "120-180", 8: "180-250", 10: "250-350"},
     "USER_DATA_FILE": "user_data.json",
-    "CACHE_FILE": "text_cache.pkl",
     "LOG_FILE": "app.log",
     "BACKUP_DIR": "backups"
 }
@@ -117,17 +115,6 @@ def restore_from_backup():
             logger.error(f"Backup restore failed: {e}")
     return {}
 
-# --- Cache Management ---
-def load_cache():
-    if os.path.exists(CONFIG["CACHE_FILE"]):
-        with open(CONFIG["CACHE_FILE"], 'rb') as f:
-            return pickle.load(f)
-    return {}
-
-def save_cache(cache):
-    with open(CONFIG["CACHE_FILE"], 'wb') as f:
-        pickle.dump(cache, f)
-
 # --- Gemini Configuration ---
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -144,12 +131,6 @@ except Exception as e:
 
 # --- Gemini Content Generation ---
 def generate_reading_text(level):
-    cache = load_cache()
-    cache_key = f"level_{level}"
-    if cache_key in cache:
-        logger.info(f"Loaded text from cache for level {level}")
-        return cache[cache_key]
-
     difficulty_map = {
         2: ("muy fácil, A1-A2 CEFR", CONFIG["WORD_RANGES"][2], "una descripción simple de un animal"),
         4: ("fácil, A2-B1 CEFR", CONFIG["WORD_RANGES"][4], "una anécdota breve"),
@@ -159,10 +140,14 @@ def generate_reading_text(level):
     }
     difficulty_desc, words, topic = difficulty_map.get(min(level, 10), difficulty_map[10])
 
+    # Add timestamp to prompt for uniqueness
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     prompt = f"""
     Eres un experto en ELE para estudiantes de 16-17 años. Genera un texto en español de nivel {difficulty_desc} ({level}/10), 
     con {words} palabras, sobre {topic}. Hazlo interesante, educativo y seguro para menores (G-rated). 
-    Evita temas sensibles y usa un lenguaje claro y adaptado al nivel. Devuelve solo el texto, sin títulos ni comentarios adicionales.
+    Evita temas sensibles y usa un lenguaje claro y adaptado al nivel. 
+    Para asegurar variedad, considera que esta solicitud se hace en {timestamp}. 
+    Devuelve solo el texto, sin títulos ni comentarios adicionales.
     """
     
     for attempt in range(CONFIG["MAX_RETRIES"]):
@@ -170,9 +155,7 @@ def generate_reading_text(level):
             response = model.generate_content(prompt)
             text = response.text.strip()
             if len(text) > 40:
-                cache[cache_key] = text
-                save_cache(cache)
-                logger.info(f"Generated text for level {level}")
+                logger.info(f"Generated unique text for level {level} at {timestamp}")
                 return text
         except Exception as e:
             logger.error(f"Text generation attempt {attempt+1} failed: {e}")
@@ -280,8 +263,7 @@ else:
     st.sidebar.write(f"Usuario: {st.session_state.username}")
     if st.sidebar.button("Cerrar Sesión"):
         username = st.session_state.username
-        if username and not st.session_state.is_admin:  # Check username exists and user isn’t admin
-            # Ensure user entry exists in user_data
+        if username and not st.session_state.is_admin:
             if username not in user_data:
                 logger.warning(f"User {username} not found in user_data during logout. Initializing.")
                 user_data[username] = {
