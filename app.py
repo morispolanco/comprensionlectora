@@ -73,7 +73,6 @@ def load_user_data():
     try:
         with open(CONFIG["USER_DATA_FILE"], 'r', encoding='utf-8') as f:
             data = json.load(f)
-            # Ensure admin exists with correct credentials
             if ADMIN_USER not in data or not verify_password(data[ADMIN_USER]["hashed_password_with_salt"], ADMIN_PASS):
                 logger.warning(f"Admin {ADMIN_USER} missing or has invalid credentials. Resetting admin.")
                 data[ADMIN_USER] = {
@@ -183,30 +182,39 @@ def generate_reading_text(level):
     return None
 
 def generate_mc_questions(text):
-    prompt = f"""
-    Basado solo en este texto:
-    ---
-    {text}
-    ---
-    Genera exactamente 5 preguntas de opción múltiple en español con 4 opciones (A-D), una sola correcta. 
-    Cubre idea principal, detalles clave, inferencias obvias y vocabulario del texto. 
-    Usa un lenguaje claro y opciones plausibles pero distintas. 
-    Devuelve solo una lista JSON válida: [{"question": "", "options": {"A": "", "B": "", "C": "", "D": ""}, "correct_answer": ""}]
-    """
+    # Define the JSON example separately to avoid f-string issues
+    json_example = '[{"question": "", "options": {"A": "", "B": "", "C": "", "D": ""}, "correct_answer": ""}]'
+    
+    prompt = (
+        "Basado solo en este texto:\n"
+        "---\n"
+        f"{text}\n"
+        "---\n"
+        "Genera exactamente 5 preguntas de opción múltiple en español con 4 opciones (A-D), una sola correcta. "
+        "Cubre idea principal, detalles clave, inferencias obvias y vocabulario del texto. "
+        "Usa un lenguaje claro y opciones plausibles pero distintas. "
+        f"Devuelve solo una lista JSON válida como esta: {json_example}"
+    )
     
     for attempt in range(CONFIG["MAX_RETRIES"]):
         try:
             response = model.generate_content(prompt)
-            json_text = response.text.strip().replace("```json", "").replace("```", "")
+            raw_response = response.text.strip()
+            logger.info(f"Raw response from Gemini: {raw_response}")  # Log raw response for debugging
+            json_text = raw_response.replace("```json", "").replace("```", "").strip()
             questions = json.loads(json_text)
             if isinstance(questions, list) and len(questions) == 5:
                 logger.info("Generated questions successfully")
                 return questions
+            else:
+                logger.error(f"Invalid question format or count: {questions}")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing failed on attempt {attempt+1}: {e}")
         except Exception as e:
             logger.error(f"Questions generation attempt {attempt+1} failed: {e}")
-            if attempt < CONFIG["MAX_RETRIES"] - 1:
-                time.sleep(1.5 ** attempt)
-    st.error("Failed to generate questions after retries.")
+        if attempt < CONFIG["MAX_RETRIES"] - 1:
+            time.sleep(1.5 ** attempt)
+    st.error("Failed to generate questions after retries. Check logs for details.")
     return None
 
 # --- Sidebar ---
