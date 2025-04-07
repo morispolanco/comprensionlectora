@@ -57,7 +57,7 @@ def verify_password(stored_password_with_salt, provided_password):
 
 def load_user_data():
     if not os.path.exists(CONFIG["USER_DATA_FILE"]):
-        logger.warning(f"{CONFIG['USER_DATA_FILE']} not found. Creating with admin.")
+        logger.info(f"{CONFIG['USER_DATA_FILE']} not found. Creating with admin: {ADMIN_USER}")
         initial_data = {
             ADMIN_USER: {
                 "hashed_password_with_salt": hash_password(ADMIN_PASS),
@@ -67,11 +67,22 @@ def load_user_data():
             }
         }
         save_user_data(initial_data)
+        logger.info(f"Admin user created with hashed password for {ADMIN_USER}")
         return initial_data
     
     try:
         with open(CONFIG["USER_DATA_FILE"], 'r', encoding='utf-8') as f:
             data = json.load(f)
+            # Ensure admin exists with correct credentials
+            if ADMIN_USER not in data or not verify_password(data[ADMIN_USER]["hashed_password_with_salt"], ADMIN_PASS):
+                logger.warning(f"Admin {ADMIN_USER} missing or has invalid credentials. Resetting admin.")
+                data[ADMIN_USER] = {
+                    "hashed_password_with_salt": hash_password(ADMIN_PASS),
+                    "level": None,
+                    "is_admin": True,
+                    "history": data.get(ADMIN_USER, {}).get("history", [])
+                }
+                save_user_data(data)
             return data if data else {}
     except (json.JSONDecodeError, Exception) as e:
         logger.error(f"Error loading user data: {e}")
@@ -88,7 +99,7 @@ def save_user_data(data):
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         os.replace(temp_file, CONFIG["USER_DATA_FILE"])
-        os.chmod(CONFIG["USER_DATA_FILE"], 0o600)  # Restrict permissions
+        os.chmod(CONFIG["USER_DATA_FILE"], 0o600)
     except Exception as e:
         logger.error(f"Error saving user data: {e}")
         st.error(f"Failed to save data: {e}")
@@ -149,7 +160,6 @@ def generate_reading_text(level):
     }
     difficulty_desc, words, topic = difficulty_map.get(min(level, 10), difficulty_map[10])
 
-    # Refined prompt for clarity and consistency
     prompt = f"""
     Eres un experto en ELE para estudiantes de 16-17 años. Genera un texto en español de nivel {difficulty_desc} ({level}/10), 
     con {words} palabras, sobre {topic}. Hazlo interesante, educativo y seguro para menores (G-rated). 
@@ -160,7 +170,7 @@ def generate_reading_text(level):
         try:
             response = model.generate_content(prompt)
             text = response.text.strip()
-            if len(text) > 40:  # Basic validation
+            if len(text) > 40:
                 cache[cache_key] = text
                 save_cache(cache)
                 logger.info(f"Generated text for level {level}")
@@ -173,7 +183,6 @@ def generate_reading_text(level):
     return None
 
 def generate_mc_questions(text):
-    # Tweaked prompt for improved question quality
     prompt = f"""
     Basado solo en este texto:
     ---
@@ -230,16 +239,19 @@ if not st.session_state.logged_in:
         with st.form("login_form"):
             username = st.text_input("Email").lower().strip()
             password = st.text_input("Contraseña", type="password")
-            if st.form_submit_button("Entrar"):
+            submitted = st.form_submit_button("Entrar")
+            if submitted:
                 if username in user_data and verify_password(user_data[username]["hashed_password_with_salt"], password):
                     st.session_state.logged_in = True
                     st.session_state.username = username
                     st.session_state.is_admin = user_data[username].get("is_admin", False)
                     st.session_state.current_level = user_data[username].get("level", CONFIG["DEFAULT_LEVEL"]) if not st.session_state.is_admin else None
-                    st.success("¡Bienvenido/a!")
+                    st.success(f"¡Bienvenido/a {username}!")
+                    logger.info(f"Successful login for {username}")
                     st.rerun()
                 else:
                     st.error("Credenciales incorrectas.")
+                    logger.warning(f"Failed login attempt for {username}")
 
     else:
         with st.form("register_form"):
@@ -255,6 +267,7 @@ if not st.session_state.logged_in:
                     user_data[email] = {"hashed_password_with_salt": hash_password(pwd), "level": CONFIG["DEFAULT_LEVEL"], "is_admin": False, "history": []}
                     save_user_data(user_data)
                     st.success("¡Registrado! Inicia sesión.")
+                    logger.info(f"New user registered: {email}")
 
 else:
     st.sidebar.write(f"Usuario: {st.session_state.username}")
@@ -325,5 +338,4 @@ else:
                     st.session_state.submitted_answers = False
                     st.rerun()
 
-# Footer with creator info
 st.caption("v1.2.0 - Desarrollado con Streamlit y Gemini por Moris Polanco | mp@ufm.edu | [morispolanco.vercel.app](https://morispolanco.vercel.app)")
