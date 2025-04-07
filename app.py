@@ -108,7 +108,6 @@ RETRY_DELAY = 2
 
 def generate_reading_text(level):
     """Genera un texto de lectura adaptado al nivel con reintentos."""
-    # ... (Código de generate_reading_text sin cambios, ya incluye reintentos) ...
     if level <= 2: difficulty_desc, words = "muy fácil, vocabulario simple, frases cortas", "50-80"
     elif level <= 4: difficulty_desc, words = "fácil, vocabulario común, frases relativamente cortas", "80-120"
     elif level <= 6: difficulty_desc, words = "intermedio, vocabulario variado, frases de longitud media", "120-180"
@@ -126,7 +125,6 @@ def generate_reading_text(level):
     for attempt in range(MAX_GEMINI_RETRIES):
         try:
             response = model.generate_content(prompt)
-            # Verificar si hay texto y si no fue bloqueado
             if hasattr(response, 'text') and response.text and len(response.text) > 30:
                 return response.text.strip()
             else:
@@ -146,7 +144,6 @@ def generate_reading_text(level):
 
 def generate_mc_questions(text):
     """Genera 5 preguntas de opción múltiple basadas en el texto con reintentos y validación."""
-    # ... (Código de generate_mc_questions sin cambios, ya incluye reintentos y validación) ...
     prompt = f"""
     Basado en el siguiente texto en español, crea EXACTAMENTE 5 preguntas de opción múltiple (A, B, C, D) para evaluar comprensión lectora de un estudiante de Quinto Bachillerato.
     Requisitos:
@@ -166,7 +163,6 @@ def generate_mc_questions(text):
     for attempt in range(MAX_GEMINI_RETRIES):
         try:
             response = model.generate_content(prompt)
-            # Intentar acceder al texto de forma segura
             raw_response_text = getattr(response, 'text', '').strip()
             json_response_text = raw_response_text.lstrip('```json').rstrip('```').strip()
 
@@ -178,28 +174,60 @@ def generate_mc_questions(text):
                     print(f"Intento {attempt+1} (Preguntas): Bloqueado por {block_reason}")
                 else:
                     print(f"Intento {attempt+1} (Preguntas): Respuesta vacía. Feedback: {feedback}")
-                continue
+                continue # Reintentar si está vacío o bloqueado
 
             parsed_data = json.loads(json_response_text)
             if isinstance(parsed_data, list) and len(parsed_data) == 5:
                 valid_structure = True
                 for i, q in enumerate(parsed_data):
-                    if not (isinstance(q, dict) and all(k in q for k in ["question", "options", "correct_answer"]) and
-                            isinstance(q["options"], dict) and len(q["options"]) == 4 and all(k in q["options"] for k in ["A", "B", "C", "D"]) and
-                            q["correct_answer"] in ["A", "B", "C", "D"] and isinstance(q["question"], str) and
-                            all(isinstance(opt, str) for opt in q["options"].values())):
-                        print(f"Error validación (Pregunta {i+1}, Intento {attempt+1}): Estructura inválida. Datos: {str(q)[:100]}...")
+                    # Validación de estructura más detallada
+                    if not (isinstance(q, dict) and
+                            all(k in q for k in ["question", "options", "correct_answer"]) and
+                            isinstance(q.get("question"), str) and q["question"] and # Asegura que no esté vacío
+                            isinstance(q.get("options"), dict) and len(q["options"]) == 4 and
+                            all(k in q["options"] for k in ["A", "B", "C", "D"]) and
+                            all(isinstance(v, str) and v for k, v in q["options"].items()) and # Opciones no vacías
+                            isinstance(q.get("correct_answer"), str) and q["correct_answer"] in ["A", "B", "C", "D"]):
+                        print(f"Error validación (Pregunta {i+1}, Intento {attempt+1}): Estructura/Tipo inválido. Datos: {str(q)[:150]}...")
                         valid_structure = False; break
-                if valid_structure: return parsed_data
-            else: print(f"Error validación (Intento {attempt+1}): No es lista de 5. Tipo: {type(parsed_data)}, Len: {len(parsed_data) if isinstance(parsed_data, list) else 'N/A'}")
-        except json.JSONDecodeError as e: print(f"Error JSONDecodeError (Preguntas, intento {attempt+1}): {e}. Respuesta: {json_response_text[:100]}..."); last_exception = e
-        except Exception as e: print(f"Error inesperado procesando preguntas (Intento {attempt+1}): {e}"); last_exception = e; feedback = getattr(response, 'prompt_feedback', None); block_reason = getattr(feedback, 'block_reason', None) if feedback else None; if block_reason: st.warning(f"Bloqueo seguridad: {block_reason}")
+                if valid_structure: return parsed_data # Éxito
+            else:
+                print(f"Error validación (Intento {attempt+1}): No es lista de 5. Tipo: {type(parsed_data)}, Len: {len(parsed_data) if isinstance(parsed_data, list) else 'N/A'}")
 
-        if attempt < MAX_GEMINI_RETRIES - 1: time.sleep(RETRY_DELAY)
+        except json.JSONDecodeError as e:
+            print(f"Error JSONDecodeError (Preguntas, intento {attempt+1}): {e}. Respuesta parcial: {json_response_text[:100]}...")
+            last_exception = e
+        except Exception as e:
+            # --- BLOQUE CORREGIDO ---
+            print(f"Error inesperado procesando preguntas (Intento {attempt+1}): {e}")
+            last_exception = e
+            # Intentar obtener feedback de seguridad incluso si hubo otro error
+            try:
+                # Asegurarse de que 'response' existe antes de intentar acceder a él
+                if 'response' in locals():
+                    feedback = getattr(response, 'prompt_feedback', None)
+                    if feedback:
+                        block_reason = getattr(feedback, 'block_reason', None)
+                        if block_reason:
+                            # Mostrar advertencia al usuario y también imprimir en consola
+                            st.warning(f"Generación bloqueada por seguridad: {block_reason}. Reintentando...")
+                            print(f"  (Intento {attempt+1} bloqueado por seguridad: {block_reason})")
+                else:
+                    print(f"  (Intento {attempt+1}: Excepción ocurrió antes de obtener 'response')")
+            except Exception as e_feedback:
+                 # Error al intentar obtener el feedback mismo
+                 print(f"  (Intento {attempt+1}: Error al procesar feedback: {e_feedback})")
+            # --- FIN BLOQUE CORREGIDO ---
 
+        # Esperar antes del siguiente intento (fuera de los except)
+        if attempt < MAX_GEMINI_RETRIES - 1:
+            time.sleep(RETRY_DELAY)
+
+    # Si sale del bucle sin éxito
     st.error(f"Error al generar/validar preguntas después de {MAX_GEMINI_RETRIES} intentos.")
-    st.text_area("Última respuesta JSON recibida:", json_response_text if json_response_text else "Vacía", height=100)
+    st.text_area("Última respuesta JSON recibida (para depuración):", json_response_text if json_response_text else "Vacía", height=100)
     return None
+
 
 # --- Función para Mostrar Info del Desarrollador ---
 def display_developer_info():
@@ -254,7 +282,6 @@ if not st.session_state.logged_in:
     if auth_choice == "Iniciar Sesión":
         st.subheader("Iniciar Sesión")
         with st.form("login_form"):
-            # ... (código del formulario de login sin cambios) ...
             username = st.text_input("Usuario (Email)", key="login_user").lower().strip()
             password = st.text_input("Contraseña", type="password", key="login_pass")
             submitted = st.form_submit_button("Entrar")
@@ -279,7 +306,6 @@ if not st.session_state.logged_in:
     elif auth_choice == "Registrarse":
         st.subheader("Registrar Nuevo Usuario (Estudiante)")
         with st.form("register_form"):
-            # ... (código del formulario de registro sin cambios) ...
             new_username = st.text_input("Nuevo Usuario (Tu Email)", key="reg_user").lower().strip()
             new_password = st.text_input("Nueva Contraseña", type="password", key="reg_pass")
             confirm_password = st.text_input("Confirmar Contraseña", type="password", key="reg_confirm")
@@ -308,7 +334,6 @@ else:
     # --- Barra Lateral para Usuario Logueado ---
     def perform_logout_and_rerun():
         """Guarda estado si es necesario, limpia sesión y recarga."""
-        # ... (código de perform_logout_and_rerun sin cambios) ...
         user_data_logout = load_user_data()
         username_logout = st.session_state.get('username')
         is_admin_logout = st.session_state.get('is_admin', False)
@@ -343,30 +368,28 @@ else:
         st.write("Progreso de los estudiantes registrados:")
 
         # --- INICIO DEBUG ADMIN PANEL (¡¡¡RECORDAR QUITAR!!!) ---
-        st.warning("MODO DEBUG ACTIVADO PARA ADMIN - ¡Quitar antes de producción!")
-        st.subheader("Debug Info (Temporal):")
-        try:
-            user_data_admin_debug = load_user_data()
-            st.write("Datos cargados user_data.json:")
-            st.json(user_data_admin_debug, expanded=False) # Muestra JSON colapsado
-        except Exception as e:
-             st.error(f"Error cargando datos en admin view (debug): {e}")
-             user_data_admin_debug = {}
-        st.write("--- Evaluando Usuarios ---")
+        # Descomenta estas líneas si necesitas depurar de nuevo el panel de admin
+        # st.warning("MODO DEBUG ACTIVADO PARA ADMIN - ¡Quitar antes de producción!")
+        # st.subheader("Debug Info (Temporal):")
+        # try:
+        #     user_data_admin_debug = load_user_data()
+        #     st.write("Datos cargados user_data.json:")
+        #     st.json(user_data_admin_debug, expanded=False) # Muestra JSON colapsado
+        # except Exception as e:
+        #      st.error(f"Error cargando datos en admin view (debug): {e}")
+        #      user_data_admin_debug = {}
+        # st.write("--- Evaluando Usuarios ---")
         # --- FIN DEBUG ADMIN PANEL ---
 
         # Cargar datos para la lógica real
         user_data_admin = load_user_data()
         student_data = []
         for user, data in user_data_admin.items():
-             # --- INICIO DEBUG ADMIN PANEL (Dentro del Bucle) ---
-             is_admin_flag = data.get('is_admin', 'AUSENTE')
-             # Corrección: Asegurarse de que el valor sea exactamente False, no solo falsy
-             es_estudiante = data.get('is_admin') is False 
-             # Alternativa: si la ausencia de flag también cuenta como estudiante
-             # es_estudiante = not data.get('is_admin', False) # Usar esta si 'AUSENTE' también es estudiante
-
-             st.write(f"User: {user} | is_admin Flag: {is_admin_flag} (Tipo: {type(data.get('is_admin'))}) | ¿Es estudiante?: {es_estudiante}")
+             # --- INICIO DEBUG ADMIN PANEL (Dentro del Bucle - ¡¡¡RECORDAR QUITAR!!!) ---
+             # Descomenta estas líneas si necesitas depurar de nuevo el panel de admin
+             # is_admin_flag = data.get('is_admin', 'AUSENTE')
+             # es_estudiante = data.get('is_admin') is False
+             # st.write(f"User: {user} | is_admin Flag: {is_admin_flag} (Tipo: {type(data.get('is_admin'))}) | ¿Es estudiante?: {es_estudiante}")
              # --- FIN DEBUG ADMIN PANEL (Dentro del Bucle) ---
 
              # Filtro corregido: Chequear explícitamente por False
@@ -375,23 +398,22 @@ else:
                      "Usuario (Email)": user,
                      "Nivel Actual": data.get('level', 'N/A')
                  })
-             # O usar este si la ausencia de flag también cuenta:
-             # if not data.get('is_admin', False): # False o Ausente
-             #      student_data.append(...)
 
-        st.write("--- Fin Evaluación (Debug) ---") # DEBUG
+        # --- INICIO DEBUG ADMIN PANEL (¡¡¡RECORDAR QUITAR!!!) ---
+        # Descomenta esta línea si necesitas depurar de nuevo el panel de admin
+        # st.write("--- Fin Evaluación (Debug) ---")
+        # --- FIN DEBUG ADMIN PANEL ---
 
         if student_data:
             df = pd.DataFrame(student_data).sort_values(by="Usuario (Email)").reset_index(drop=True)
             st.dataframe(df, use_container_width=True)
         else:
-            st.info("Aún no hay estudiantes registrados (o no se identificaron como tales). Verifica el Debug Info y el archivo user_data.json.")
+            st.info("Aún no hay estudiantes registrados (o no se identificaron como tales).") # Mensaje si no hay datos o el filtro falla
 
 
     # --- Vista de Estudiante ---
     else:
         st.title("🚀 Práctica de Comprensión Lectora 🚀")
-        # ... (Código de la vista de estudiante sin cambios: botón generar, mostrar texto/preguntas, formulario, feedback, adaptación nivel) ...
         if st.session_state.current_text is None or st.session_state.current_questions is None:
             st.markdown("---"); st.info("¡Listo/a para practicar!")
             if st.button("✨ Generar Texto y Preguntas ✨", key="generate_content", type="primary"):
@@ -415,6 +437,7 @@ else:
                 temp_answers = {}
                 for i, q in enumerate(st.session_state.current_questions):
                     options_list = list(q["options"].values()); options_dict = q["options"]
+                    # Usar hash del texto como parte de la clave para forzar reinicio si el texto cambia
                     radio_key = f"q_{i}_{st.session_state.current_level}_{hash(st.session_state.current_text)}"
                     current_selection_index = None
                     if st.session_state.submitted_answers:
@@ -453,13 +476,14 @@ else:
                 if not st.session_state.feedback_given:
                     previous_level = st.session_state.current_level; level_changed = False
                     user_data_level = load_user_data()
-                    if score_percentage >= 80:
+                    if score_percentage >= 80: # 4 o 5 correctas
                         if st.session_state.current_level < MAX_LEVEL: st.session_state.current_level += 1; level_changed = True; st.success("¡Muy bien! Aumentando dificultad.")
                         else: st.success("¡Excelente! ¡Nivel máximo alcanzado!")
-                    elif score_percentage < 40:
+                    elif score_percentage < 40: # 0 o 1 correcta
                          if st.session_state.current_level > MIN_LEVEL: st.session_state.current_level -= 1; level_changed = True; st.warning("Vamos a probar un nivel más sencillo.")
                          else: st.info("¡Sigue practicando en este nivel!")
-                    else: st.info("¡Buen intento! Mantenemos el nivel.")
+                    else: # 2 o 3 correctas
+                         st.info("¡Buen intento! Mantenemos el nivel.")
                     if level_changed:
                          st.write(f"Nuevo nivel de práctica: **{st.session_state.current_level}**")
                          username_level = st.session_state.username
@@ -472,4 +496,4 @@ else:
 
 # --- Footer ---
 st.markdown("---")
-st.caption("Aplicación de Práctica Lectora Adaptativa v1.3 | Moris Polanco")
+st.caption("Aplicación de Práctica Lectora Adaptativa v1.4 | Moris Polanco")
