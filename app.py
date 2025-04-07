@@ -182,7 +182,6 @@ def generate_reading_text(level):
     return None
 
 def generate_mc_questions(text):
-    # Define the JSON example separately to avoid f-string issues
     json_example = '[{"question": "", "options": {"A": "", "B": "", "C": "", "D": ""}, "correct_answer": ""}]'
     
     prompt = (
@@ -200,7 +199,7 @@ def generate_mc_questions(text):
         try:
             response = model.generate_content(prompt)
             raw_response = response.text.strip()
-            logger.info(f"Raw response from Gemini: {raw_response}")  # Log raw response for debugging
+            logger.info(f"Raw response from Gemini: {raw_response}")
             json_text = raw_response.replace("```json", "").replace("```", "").strip()
             questions = json.loads(json_text)
             if isinstance(questions, list) and len(questions) == 5:
@@ -280,9 +279,20 @@ if not st.session_state.logged_in:
 else:
     st.sidebar.write(f"Usuario: {st.session_state.username}")
     if st.sidebar.button("Cerrar Sesión"):
-        if not st.session_state.is_admin:
-            user_data[st.session_state.username]["level"] = st.session_state.current_level
+        username = st.session_state.username
+        if username and not st.session_state.is_admin:  # Check username exists and user isn’t admin
+            # Ensure user entry exists in user_data
+            if username not in user_data:
+                logger.warning(f"User {username} not found in user_data during logout. Initializing.")
+                user_data[username] = {
+                    "hashed_password_with_salt": user_data.get(username, {}).get("hashed_password_with_salt", ""),
+                    "level": CONFIG["DEFAULT_LEVEL"],
+                    "is_admin": False,
+                    "history": []
+                }
+            user_data[username]["level"] = st.session_state.current_level
             save_user_data(user_data)
+            logger.info(f"Updated level for {username} to {st.session_state.current_level} on logout")
         st.session_state.clear()
         st.session_state.logged_in = False
         st.rerun()
