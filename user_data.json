@@ -1,0 +1,46 @@
+# (Este código es solo para generar el hash inicial, no va en app.py)
+import hashlib
+import json
+import os # Necesario para generar un salt aleatorio
+
+def hash_password(password):
+    salt = os.urandom(16) # Genera un salt aleatorio
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return salt.hex() + ':' + pwd_hash.hex() # Guarda salt y hash juntos
+
+admin_user = "mp@ufm.edu"
+admin_pass = "moris123"
+hashed_admin_pass = hash_password(admin_pass)
+
+initial_data = {
+    admin_user: {
+        "hashed_password_with_salt": hashed_admin_pass,
+        "level": None, # Los administradores no tienen nivel de lectura
+        "is_admin": True
+    }
+}
+
+try:
+    with open("user_data.json", "w") as f:
+        json.dump(initial_data, f, indent=4)
+    print("user_data.json creado con el usuario administrador.")
+except Exception as e:
+    print(f"Error al crear user_data.json: {e}")
+
+# Verifica la contraseña (solo para demostrar cómo funciona)
+def verify_password(stored_password_with_salt, provided_password):
+    try:
+        salt_hex, stored_hash_hex = stored_password_with_salt.split(':')
+        salt = bytes.fromhex(salt_hex)
+        stored_hash = bytes.fromhex(stored_hash_hex)
+        pwd_hash = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
+        return pwd_hash == stored_hash
+    except ValueError: # Maneja el caso donde el formato no es correcto
+        print("Error: Formato de contraseña almacenada inválido.")
+        return False
+    except Exception as e:
+        print(f"Error al verificar contraseña: {e}")
+        return False
+
+# print(f"Verificando contraseña de admin: {verify_password(hashed_admin_pass, admin_pass)}") # Debería imprimir True
+# print(f"Verificando contraseña incorrecta: {verify_password(hashed_admin_pass, 'incorrecta')}") # Debería imprimir False
