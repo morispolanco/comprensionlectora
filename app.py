@@ -24,7 +24,7 @@ CONFIG = {
     "DB_FILE": "user_data.db", # New: SQLite database file
     "LOG_FILE": "app.log",
     "BACKUP_DIR": "backups", # Still keep for DB backups
-    "APP_VERSION": "1.3.2", # Updated version after fix
+    "APP_VERSION": "1.3.3", # Updated version after fixes
     "CACHE_FILE": "text_cache.pkl"
 }
 
@@ -46,7 +46,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Security Functions (Moved up) ---
+# --- Security Functions (Moved up to be defined before use) ---
 def hash_password(password):
     """Hashes a password using PBKDF2 with a random salt."""
     salt = os.urandom(16)
@@ -95,13 +95,13 @@ def init_db():
 
     try:
         with conn: # Use 'with' for transaction management
-            # Corrected CREATE TABLE statement: embed the default level directly
+            # Corrected CREATE TABLE statement: removed NOT NULL from current_level
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY UNIQUE,
                     hashed_password_with_salt TEXT NOT NULL,
                     is_admin INTEGER NOT NULL DEFAULT 0,
-                    current_level INTEGER NOT NULL DEFAULT {CONFIG["DEFAULT_LEVEL"]}, -- Embed default level directly
+                    current_level INTEGER DEFAULT {CONFIG["DEFAULT_LEVEL"]}, -- Removed NOT NULL, allows NULL for admins
                     history TEXT NOT NULL DEFAULT '[]' -- Store history as JSON string
                 )
             """) # No second argument needed here anymore
@@ -114,6 +114,7 @@ def init_db():
                 # hash_password is now defined before this call
                 hashed_pass = hash_password(ADMIN_PASS)
                 # For the admin user specifically, level is None, history is empty
+                # This INSERT is now valid because current_level is nullable
                 conn.execute("INSERT INTO users (username, hashed_password_with_salt, is_admin, current_level, history) VALUES (?, ?, ?, ?, ?)",
                             (ADMIN_USER, hashed_pass, 1, None, json.dumps([])))
                 logger.info(f"Admin user '{ADMIN_USER}' created.")
@@ -594,7 +595,12 @@ else: # User is logged in
         # Check if we need to load/generate new content
         if st.session_state.current_text is None or st.session_state.current_questions is None or not st.session_state.current_questions:
             # Only show the button to start/continue if no text/questions are loaded or if questions load failed previously
-            if st.button("Comenzar" if (st.session_state.score == 0 and not st.session_state.feedback_given) else "Siguiente", type="primary"):
+            # Adjusted button text logic
+            button_text = "Comenzar"
+            if st.session_state.score > 0 or st.session_state.feedback_given:
+                 button_text = "Siguiente"
+
+            if st.button(button_text, type="primary"):
                 # Reset score display and feedback status when requesting new text
                 st.session_state.score = 0
                 st.session_state.feedback_given = False
@@ -613,11 +619,13 @@ else: # User is logged in
                              # Clear text if question generation failed, so the button reappears
                             st.session_state.current_text = None
                             st.session_state.current_questions = None
+                            st.session_state.user_answers = {} # Also reset user answers state
                             st.error("No se pudieron generar preguntas para el texto. Inténtalo de nuevo.")
                     else:
                          # Clear if text generation failed
                          st.session_state.current_text = None
                          st.session_state.current_questions = None
+                         st.session_state.user_answers = {} # Also reset user answers state
                          st.error("No se pudo generar un texto de lectura. Inténtalo de nuevo.")
 
 
@@ -647,10 +655,15 @@ else: # User is logged in
                             try:
                                 # Find the index of the previously selected option string (e.g., "A. Option A")
                                 prev_answer_letter = st.session_state.user_answers[i]
-                                prev_answer_string_prefix = f"{prev_answer_letter}."
-                                default_index = next((j for j, opt_str in enumerate(options) if opt_str.startswith(prev_answer_string_prefix)), None)
+                                # Ensure prev_answer_letter is one of the valid option keys
+                                if prev_answer_letter in q['options']:
+                                     prev_answer_string_prefix = f"{prev_answer_letter}."
+                                     default_index = next((j for j, opt_str in enumerate(options) if opt_str.startswith(prev_answer_string_prefix)), None)
+                                else:
+                                     logger.warning(f"Invalid previously selected answer letter '{prev_answer_letter}' for question {i}. Not in options.")
+
                             except Exception as e:
-                                logger.warning(f"Could not find default index for question {i} with answer {st.session_state.user_answers[i]}: {e}")
+                                logger.warning(f"Error determining default index for question {i} with answer {st.session_state.user_answers[i]}: {e}")
 
 
                         selection = st.radio(
@@ -666,8 +679,8 @@ else: # User is logged in
 
                     # Update the session state user_answers dictionary with current selections
                     # This happens when the form is interacted with, before submission button logic
+                    # It's important to do this before the submit button logic so the state is correct upon submit
                     st.session_state.user_answers = user_selections
-
 
                     submit_button = st.form_submit_button("Enviar", disabled=is_submitted)
 
@@ -676,9 +689,10 @@ else: # User is logged in
             if is_submitted:
                 # Calculate score based on the stored user_answers and correct answers
                 score = 0
+                # Iterate through the original questions to check against submitted answers
                 for i, q in enumerate(st.session_state.current_questions):
-                    # Check if the question was answered and if the answer is correct
-                    # Ensure the user answer exists for this question index
+                    # Check if the user provided an answer for this question index
+                    # And if that answer matches the correct answer letter
                     if i in st.session_state.user_answers and st.session_state.user_answers[i] == q["correct_answer"]:
                         score += 1
 
@@ -689,7 +703,7 @@ else: # User is logged in
                 # Display feedback for each question
                 st.subheader("Respuestas:")
                 for i, q in enumerate(st.session_state.current_questions):
-                    user_answer_letter = st.session_state.user_answers.get(i) # Get the selected letter
+                    user_answer_letter = st.session_state.user_answers.get(i) # Get the selected letter by index
                     correct_answer_letter = q["correct_answer"]
                     correct_option_text = q['options'].get(correct_answer_letter, "Opción no encontrada")
 
@@ -700,7 +714,7 @@ else: # User is logged in
                             st.success(f"**{i+1}. Correcto.**")
                         else: # Answered, but wrong
                            st.error(f"**{i+1}. Incorrecto.** Tu respuesta fue '{user_answer_letter}. {user_option_text}'. La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
-                    else: # Not answered
+                    else: # Not answered (shouldn't happen with radio buttons unless they are skipped, but good safety)
                          st.warning(f"**{i+1}. No respondido.** La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
 
 
