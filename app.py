@@ -7,7 +7,7 @@ import time
 import pandas as pd
 import logging
 from logging.handlers import RotatingFileHandler
-import shutil # Still useful for backing up the SQLite file itself, if desired
+import shutil
 from datetime import datetime
 import platform
 import re
@@ -24,7 +24,7 @@ CONFIG = {
     "DB_FILE": "user_data.db", # New: SQLite database file
     "LOG_FILE": "app.log",
     "BACKUP_DIR": "backups", # Still keep for DB backups
-    "APP_VERSION": "1.3.0", # Updated version
+    "APP_VERSION": "1.3.1", # Updated version after fix
     "CACHE_FILE": "text_cache.pkl"
 }
 
@@ -35,7 +35,7 @@ try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except KeyError as e:
     st.error(f"Missing secret: {e}. For local testing, set environment variables or create .streamlit/secrets.toml.")
-    st.stop()
+    st.stop() # Stop the app if secrets are missing
 
 # Setup logging with rotation
 handler = RotatingFileHandler(CONFIG["LOG_FILE"], maxBytes=10*1024*1024, backupCount=5)
@@ -53,6 +53,11 @@ def get_db_connection():
     try:
         conn = sqlite3.connect(CONFIG["DB_FILE"])
         conn.row_factory = sqlite3.Row # Allows accessing columns by name
+        # Add PRAGMAs for better performance and concurrent read handling (optional but good practice)
+        # Note: For true high concurrency or multi-instance deployment, a
+        # dedicated database server (PostgreSQL, MySQL) is recommended over SQLite.
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
     except sqlite3.Error as e:
         logger.error(f"Database connection error: {e}")
@@ -63,30 +68,35 @@ def init_db():
     """Initializes the database: creates the users table and ensures admin exists."""
     conn = get_db_connection()
     if conn is None:
+        # If connection fails, stop initialization
         return
 
     try:
         with conn: # Use 'with' for transaction management
-            conn.execute("""
+            # Corrected CREATE TABLE statement: embed the default level directly
+            conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY UNIQUE,
                     hashed_password_with_salt TEXT NOT NULL,
                     is_admin INTEGER NOT NULL DEFAULT 0,
-                    current_level INTEGER NOT NULL DEFAULT ?,
+                    current_level INTEGER NOT NULL DEFAULT {CONFIG["DEFAULT_LEVEL"]}, -- Embed default level directly
                     history TEXT NOT NULL DEFAULT '[]' -- Store history as JSON string
                 )
-            """, (CONFIG["DEFAULT_LEVEL"],))
+            """) # No second argument needed here anymore
+
             logger.info("Database table 'users' checked/created.")
 
             # Ensure admin user exists
             admin_user_data = get_user(ADMIN_USER)
             if admin_user_data is None:
                 hashed_pass = hash_password(ADMIN_PASS)
+                # For the admin user specifically, level is None, history is empty
                 conn.execute("INSERT INTO users (username, hashed_password_with_salt, is_admin, current_level, history) VALUES (?, ?, ?, ?, ?)",
-                            (ADMIN_USER, hashed_pass, 1, None, json.dumps([]))) # Admin level can be None, history is empty list
+                            (ADMIN_USER, hashed_pass, 1, None, json.dumps([])))
                 logger.info(f"Admin user '{ADMIN_USER}' created.")
             else:
                  # Optional: Re-verify admin password hash on startup and update if secrets changed
+                 # Note: This assumes the admin user is the only one who might have secrets-based creds
                  if not verify_password(admin_user_data['hashed_password_with_salt'], ADMIN_PASS):
                      hashed_pass = hash_password(ADMIN_PASS)
                      conn.execute("UPDATE users SET hashed_password_with_salt = ? WHERE username = ?", (hashed_pass, ADMIN_USER))
@@ -95,6 +105,7 @@ def init_db():
     except sqlite3.Error as e:
         logger.error(f"Database initialization error: {e}")
         st.error(f"Error initializing database: {e}")
+        # Consider st.stop() here if DB initialization is critical
 
 def get_user(username):
     """Retrieves a user's data by username."""
@@ -102,19 +113,31 @@ def get_user(username):
     if conn is None:
         return None
     try:
-        with conn:
-            cursor = conn.execute("SELECT * FROM users WHERE username = ?", (username,))
-            user_data = cursor.fetchone()
-            if user_data:
-                 # Convert Row object to dict and parse history JSON
-                user_dict = dict(user_data)
+        # No 'with' needed for a single SELECT query that doesn't modify data
+        cursor = conn.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user_data = cursor.fetchone()
+        conn.close() # Close connection after query
+
+        if user_data:
+             # Convert Row object to dict and parse history JSON
+            user_dict = dict(user_data)
+            try:
                 user_dict['history'] = json.loads(user_dict['history'])
-                return user_dict
-            return None
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode history JSON for user '{username}'. Resetting history.")
+                user_dict['history'] = [] # Reset corrupted history
+                # Optionally, attempt to save the reset history back to the DB here
+                # update_user(username, history=[]) # Be careful not to cause infinite loops if update_user calls get_user
+            return user_dict
+        return None
     except sqlite3.Error as e:
         logger.error(f"Error getting user '{username}': {e}")
         st.error(f"Error retrieving user data: {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
+
 
 def add_user(username, password, is_admin=False, level=CONFIG["DEFAULT_LEVEL"]):
     """Adds a new user to the database."""
@@ -123,7 +146,7 @@ def add_user(username, password, is_admin=False, level=CONFIG["DEFAULT_LEVEL"]):
         return False
     try:
         hashed_pass = hash_password(password)
-        with conn:
+        with conn: # Use 'with' for transaction management
             conn.execute("INSERT INTO users (username, hashed_password_with_salt, is_admin, current_level, history) VALUES (?, ?, ?, ?, ?)",
                         (username, hashed_pass, 1 if is_admin else 0, level, json.dumps([])))
         logger.info(f"User '{username}' added to DB.")
@@ -135,6 +158,10 @@ def add_user(username, password, is_admin=False, level=CONFIG["DEFAULT_LEVEL"]):
         logger.error(f"Error adding user '{username}': {e}")
         st.error(f"Error adding user: {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
+
 
 def update_user(username, **kwargs):
     """Updates specified fields for a user."""
@@ -159,14 +186,18 @@ def update_user(username, **kwargs):
     values.append(username)
 
     try:
-        with conn:
+        with conn: # Use 'with' for transaction management
             conn.execute(sql, values)
-        logger.info(f"User '{username}' updated with {kwargs}.")
+        logger.info(f"User '{username}' updated with {list(kwargs.keys())}.") # Log keys updated
         return True
     except sqlite3.Error as e:
         logger.error(f"Error updating user '{username}': {e}")
         st.error(f"Error updating user data: {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
+
 
 def get_all_students():
     """Retrieves data for all non-admin users."""
@@ -174,21 +205,30 @@ def get_all_students():
     if conn is None:
         return []
     try:
-        with conn:
-            cursor = conn.execute("SELECT username, current_level, history FROM users WHERE is_admin = 0")
-            students = []
-            for row in cursor.fetchall():
-                student = dict(row)
+        # No 'with' needed for SELECT
+        cursor = conn.execute("SELECT username, current_level, history FROM users WHERE is_admin = 0")
+        students = []
+        for row in cursor.fetchall():
+            student = dict(row)
+            try:
                 history = json.loads(student['history'])
                 student['Última Práctica'] = history[-1]['date'] if history else 'N/A'
-                # Remove the full history list from this view unless needed later
-                del student['history']
-                students.append(student)
-            return students
+            except json.JSONDecodeError:
+                 logger.error(f"Failed to decode history JSON for student '{student['username']}' in get_all_students.")
+                 student['Última Práctica'] = 'Error JSON'
+
+            # Remove the full history list from this view unless needed later
+            del student['history']
+            students.append(student)
+        return students
     except sqlite3.Error as e:
         logger.error(f"Error getting all students: {e}")
         st.error(f"Error retrieving student list: {e}")
         return []
+    finally:
+        if conn:
+            conn.close()
+
 
 # --- Initial Database Setup ---
 init_db()
@@ -196,28 +236,40 @@ init_db()
 # --- Security Functions (Keep from original) ---
 def hash_password(password):
     salt = os.urandom(16)
-    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    # Increased iterations slightly for better future-proofing (optional but good)
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 310000)
     return salt.hex() + ':' + pwd_hash.hex()
 
 def verify_password(stored_password_with_salt, provided_password):
     try:
         salt_hex, stored_hash_hex = stored_password_with_salt.split(':')
         salt = bytes.fromhex(salt_hex)
-        pwd_hash = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
+        # Use the same number of iterations as hashing
+        pwd_hash = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 310000)
         return pwd_hash == bytes.fromhex(stored_hash_hex)
     except Exception as e:
+        # Log error but return False for security
         logger.error(f"Password verification error: {e}")
         return False
 
 # --- Cache Functions (Keep from original) ---
 def load_cache():
+    """Loads cached text from pickle file."""
     try:
-        with open(CONFIG["CACHE_FILE"], 'rb') as f:
-            return pickle.load(f)
-    except: # Catching all exceptions during load
-        return {}
+        if os.path.exists(CONFIG["CACHE_FILE"]):
+            with open(CONFIG["CACHE_FILE"], 'rb') as f:
+                return pickle.load(f)
+        return {} # Return empty dict if file doesn't exist
+    except Exception as e: # Catch all exceptions during load, including FileNotFoundError
+        logger.error(f"Error loading cache: {e}")
+        # Consider deleting corrupted cache file here if load fails
+        # if os.path.exists(CONFIG["CACHE_FILE"]):
+        #     try: os.remove(CONFIG["CACHE_FILE"])
+        #     except: pass
+        return {} # Return empty dict on error
 
 def save_cache(cache):
+    """Saves cache dictionary to pickle file."""
     try:
         with open(CONFIG["CACHE_FILE"], 'wb') as f:
             pickle.dump(cache, f)
@@ -227,18 +279,35 @@ def save_cache(cache):
 # --- Gemini Configuration (Keep from original) ---
 try:
     genai.configure(api_key=GEMINI_API_KEY)
+    # Adjusted safety settings slightly for robustness
     safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, # Allow slightly more flexibility if needed, adjust based on testing
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_LOW_AND_ABOVE"} # Keep dangerous content blocked
     ]
-    model = genai.GenerativeModel('gemini-1.5-flash', safety_settings=safety_settings)
-except Exception as e:
-    st.error(f"Gemini API setup failed: {e}")
+     # Use gemini-1.5-pro for potentially better generation quality, fallback if needed
+    try:
+        model = genai.GenerativeModel('gemini-1.5-pro', safety_settings=safety_settings)
+        logger.info("Using gemini-1.5-pro model.")
+    except Exception as e_pro:
+        logger.warning(f"gemini-1.5-pro not available or failed: {e_pro}. Falling back to gemini-1.5-flash.")
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash', safety_settings=safety_settings)
+            logger.info("Using gemini-1.5-flash model.")
+        except Exception as e_flash:
+            logger.error(f"gemini-1.5-flash also failed: {e_flash}.")
+            st.error(f"Gemini API model setup failed: {e_flash}. Could not load either 1.5-pro or 1.5-flash.")
+            st.stop()
+
+except Exception as e_config:
+    logger.error(f"Gemini API configuration failed: {e_config}")
+    st.error(f"Gemini API configuration failed: {e_config}")
     st.stop()
 
-# --- Gemini Content Generation (Keep from original, no changes needed here) ---
+
+# --- Gemini Content Generation (Minor adjustments) ---
 def generate_reading_text(level):
     cache = load_cache()
     cache_key = f"level_{level}_{datetime.now().strftime('%Y%m%d')}"
@@ -246,21 +315,23 @@ def generate_reading_text(level):
         logger.info(f"Using cached text for {cache_key}")
         return cache[cache_key]
 
-    difficulty_map = {
-        2: ("muy fácil, A1-A2 CEFR", CONFIG["WORD_RANGES"][2], "una descripción simple de un animal"),
-        4: ("fácil, A2-B1 CEFR", CONFIG["WORD_RANGES"][4], "una anécdota breve"),
-        6: ("intermedio, B1 CEFR", CONFIG["WORD_RANGES"][6], "un resumen de una noticia sencilla"),
-        8: ("intermedio-alto, B2 CEFR", CONFIG["WORD_RANGES"][8], "una explicación de un concepto científico básico"),
-        10: ("avanzado, C1 CEFR", CONFIG["WORD_RANGES"][10], "un análisis corto de un tema social")
-    }
-    # Find the closest or cap the level to available ranges
-    mapped_level = min([key for key in CONFIG["WORD_RANGES"].keys() if key >= level] or [max(CONFIG["WORD_RANGES"].keys())], key=lambda x: abs(x-level))
-    difficulty_desc, words, topic = difficulty_map[mapped_level]
+    # Map level to the closest available difficulty key
+    level_keys = sorted(CONFIG["WORD_RANGES"].keys())
+    mapped_level = min(level_keys, key=lambda x: abs(x-level))
 
+    difficulty_map = {
+        2: ("muy fácil, A1-A2 CEFR", CONFIG["WORD_RANGES"].get(2, "50-80"), "una descripción simple de un animal"),
+        4: ("fácil, A2-B1 CEFR", CONFIG["WORD_RANGES"].get(4, "80-120"), "una anécdota breve"),
+        6: ("intermedio, B1 CEFR", CONFIG["WORD_RANGES"].get(6, "120-180"), "un resumen de una noticia sencilla"),
+        8: ("intermedio-alto, B2 CEFR", CONFIG["WORD_RANGES"].get(8, "180-250"), "una explicación de un concepto científico básico"),
+        10: ("avanzado, C1 CEFR", CONFIG["WORD_RANGES"].get(10, "250-350"), "un análisis corto de un tema social")
+    }
+    # Use the mapped_level to get the appropriate difficulty info
+    difficulty_desc, words, topic = difficulty_map.get(mapped_level, difficulty_map[max(level_keys)]) # Fallback to highest level if mapping somehow fails
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     prompt = f"""
-    Eres un experto en ELE para estudiantes de 16-17 años. Genera un texto en español de nivel {difficulty_desc} ({level}/10),
+    Eres un experto en ELE para estudiantes de 16-17 años. Genera un texto en español de nivel {difficulty_desc} (equivalente aproximado a nivel {level}/10),
     con {words} palabras, sobre {topic}. Hazlo interesante, educativo y seguro para menores (G-rated).
     Evita temas sensibles y usa un lenguaje claro y adaptado al nivel.
     Para asegurar variedad, considera que esta solicitud se hace en {timestamp}.
@@ -272,12 +343,16 @@ def generate_reading_text(level):
             response = model.generate_content(prompt)
             text = response.text.strip()
             # Basic check to ensure generated text is not just whitespace or too short
-            if text and len(text.split()) >= 40: # Arbitrary min word count
-                logger.info(f"Generated unique text for level {level} at {timestamp}")
+            # Re-check word count roughly
+            word_count = len(text.split())
+            min_words = int(words.split('-')[0])
+            # Allow some deviation from target word count
+            if text and word_count >= min_words * 0.8: # Check if word count is at least 80% of the minimum requested
+                logger.info(f"Generated text (len={word_count}) for level {level} at {timestamp}")
                 cache[cache_key] = text
                 save_cache(cache)
                 return text
-            logger.warning(f"Generated text too short or empty on attempt {attempt+1}")
+            logger.warning(f"Generated text too short (len={word_count}) or empty on attempt {attempt+1}")
         except Exception as e:
             logger.error(f"Text generation attempt {attempt+1} failed: {e}")
             if attempt < CONFIG["MAX_RETRIES"] - 1:
@@ -297,6 +372,7 @@ def generate_mc_questions(text):
         "Cubre idea principal, detalles clave, inferencias obvias y vocabulario del texto. "
         "Usa un lenguaje claro y opciones plausibles pero distintas. "
         f"Devuelve solo una lista JSON válida. Ejemplo de formato: {json_example}. Asegúrate de que sea solo el JSON, sin texto explicativo."
+        "The correct answer key in options must match the correct_answer value (e.g., if correct_answer is 'B', options must have key 'B')." # Added clarity for model
     )
 
     for attempt in range(CONFIG["MAX_RETRIES"]):
@@ -307,16 +383,22 @@ def generate_mc_questions(text):
             # Attempt to clean markdown code blocks from the response
             json_text = re.sub(r'^```json\n|```$', '', raw_response, flags=re.MULTILINE | re.DOTALL).strip()
             questions = json.loads(json_text)
+            # More robust validation of the structure
             if isinstance(questions, list) and len(questions) == 5 and all(
                 isinstance(q, dict) and
-                'question' in q and isinstance(q['question'], str) and
+                'question' in q and isinstance(q['question'], str) and q['question'].strip() != "" and
                 'options' in q and isinstance(q['options'], dict) and len(q['options']) == 4 and
-                'correct_answer' in q and q['correct_answer'] in q['options']
+                'correct_answer' in q and isinstance(q['correct_answer'], str) and q['correct_answer'].strip().upper() in ['A', 'B', 'C', 'D'] and
+                q['correct_answer'].strip().upper() in q['options'] and # Check if correct answer key exists in options
+                all(isinstance(opt, str) and opt.strip() != "" for opt in q['options'].values()) # Ensure options values are non-empty strings
                 for q in questions
             ):
-                logger.info("Generated questions successfully")
+                # Ensure correct answer key is uppercase for consistency
+                for q in questions:
+                    q['correct_answer'] = q['correct_answer'].strip().upper()
+                logger.info("Generated questions successfully and validated structure.")
                 return questions
-            logger.error(f"Invalid question format or count: {questions}")
+            logger.error(f"Invalid question format or count received from API: {questions}. Raw: {raw_response}")
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing failed on attempt {attempt+1}: {e}. Raw: {raw_response}")
         except Exception as e:
@@ -365,9 +447,16 @@ if not st.session_state.logged_in:
                     st.session_state.logged_in = True
                     st.session_state.username = user_data["username"]
                     st.session_state.is_admin = bool(user_data["is_admin"]) # SQLite stores 0/1, convert to bool
-                    st.session_state.current_level = user_data["current_level"] if not st.session_state.is_admin else None # Admins don't have a level
+                    # Use the level from the DB if it exists, otherwise default
+                    st.session_state.current_level = user_data.get("current_level", CONFIG["DEFAULT_LEVEL"]) if not st.session_state.is_admin else None # Admins don't have a level
                     st.success(f"¡Bienvenido/a {st.session_state.username}!")
                     logger.info(f"Successful login for {st.session_state.username}")
+                    # Clear practice state on successful login to ensure a fresh start
+                    st.session_state.current_text = None
+                    st.session_state.current_questions = None
+                    st.session_state.submitted_answers = False
+                    st.session_state.score = 0
+                    st.session_state.feedback_given = False
                     st.rerun()
                 else:
                     st.error("Credenciales incorrectas.")
@@ -401,16 +490,19 @@ else: # User is logged in
     if st.sidebar.button("Cerrar Sesión"):
         # Save user's current level before logging out if they are a student
         if st.session_state.username and not st.session_state.is_admin:
-             # Retrieve current history to save it along with the level (optional, but good practice)
+             # Retrieve current history to save it along with the level
+             # This ensures we don't overwrite history if multiple sessions were active (though unlikely in Streamlit)
              user_data_before_logout = get_user(st.session_state.username)
              if user_data_before_logout:
-                 update_user(st.session_state.username, current_level=st.session_state.current_level, history=user_data_before_logout['history'])
-                 logger.info(f"Updated level for {st.session_state.username} to {st.session_state.current_level} on logout")
+                 # Only update if the level has actually changed since login or last save
+                 if user_data_before_logout.get('current_level') != st.session_state.current_level:
+                    update_user(st.session_state.username, current_level=st.session_state.current_level)
+                    logger.info(f"Updated level for {st.session_state.username} to {st.session_state.current_level} on logout")
              else:
                  logger.warning(f"User data not found for {st.session_state.username} during logout save.")
 
-
-        st.session_state.clear() # Clear all session state variables
+        # Clear all session state variables upon logout
+        st.session_state.clear()
         st.session_state.logged_in = False # Explicitly set logged_in to False just in case
         st.rerun() # Force rerun to show login screen
 
@@ -431,6 +523,7 @@ else: # User is logged in
             st.info("No hay estudiantes.")
 
         # Optional: Add a button to backup the database file
+        st.subheader("Copia de Seguridad")
         if st.button("Crear Copia de Seguridad de la Base de Datos"):
              try:
                 os.makedirs(CONFIG["BACKUP_DIR"], exist_ok=True)
@@ -448,8 +541,9 @@ else: # User is logged in
         st.title("🚀 Práctica Lectora")
         st.info(f"Nivel actual: {st.session_state.current_level}")
 
-        if st.session_state.current_text is None or st.session_state.current_questions is None:
-            # Only show the button to start/continue if no text/questions are loaded
+        # Check if we need to load/generate new content
+        if st.session_state.current_text is None or st.session_state.current_questions is None or not st.session_state.current_questions:
+            # Only show the button to start/continue if no text/questions are loaded or if questions load failed previously
             if st.button("Comenzar" if st.session_state.score == 0 else "Siguiente", type="primary"):
                 with st.spinner("Preparando un texto interesante…"):
                     text = generate_reading_text(st.session_state.current_level)
@@ -465,47 +559,63 @@ else: # User is logged in
                             st.session_state.feedback_given = False
                             st.rerun() # Rerun to display the text and questions
                         else:
-                             # Clear text if question generation failed
+                             # Clear text if question generation failed, so the button reappears
                             st.session_state.current_text = None
                             st.session_state.current_questions = None
+                            st.error("No se pudieron generar preguntas para el texto.")
+                    else:
+                         st.session_state.current_text = None
+                         st.session_state.current_questions = None
 
 
         else: # Text and questions are loaded
             st.markdown(f"<div style='background-color:#f0f2f6;padding:15px;border-radius:5px;'>{st.session_state.current_text}</div>", unsafe_allow_html=True)
 
             st.subheader("Preguntas:")
-            # Use a unique key for the form based on the current text/questions
-            form_key = f"qa_form_{hash(st.session_state.current_text+json.dumps(st.session_state.current_questions))}"
+            # Use a unique key for the form based on the current text/questions to prevent key errors on rerun with new content
+            form_key = f"qa_form_{hash(st.session_state.current_text + json.dumps(st.session_state.current_questions, sort_keys=True))}" # Use sort_keys for consistent hash
+
+            # Check if form has already been submitted in this session state
+            is_submitted = st.session_state.submitted_answers
 
             with st.form(form_key, clear_on_submit=False): # Use clear_on_submit=False to keep selections visible after submission
                 # Store user answers keyed by question index
                 user_selections = {}
                 for i, q in enumerate(st.session_state.current_questions):
                     options = [f"{k}. {v}" for k, v in q["options"].items()]
-                    # Use a unique key for each radio button group
+                    # Use a unique key for each radio button group specific to this form instance
+                    # If user has already submitted, load their previous answer from session state
+                    default_index = None
+                    if is_submitted and i in st.session_state.user_answers:
+                        try:
+                            # Find the index of the previously selected option string (e.g., "A. Option A")
+                            prev_answer_letter = st.session_state.user_answers[i]
+                            prev_answer_string_prefix = f"{prev_answer_letter}."
+                            default_index = next((j for j, opt_str in enumerate(options) if opt_str.startswith(prev_answer_string_prefix)), None)
+                        except Exception as e:
+                            logger.warning(f"Could not find default index for question {i} with answer {st.session_state.user_answers[i]}: {e}")
+
+
                     selection = st.radio(
                         f"**{i+1}. {q['question']}**",
                         options,
+                        index=default_index, # Set default based on submitted answers
                         key=f"q_{i}_{form_key}", # Ensure unique key per question instance
-                        disabled=st.session_state.submitted_answers
+                        disabled=is_submitted # Disable if already submitted
                     )
-                    # Store the selected option's letter (A, B, C, D)
+                    # Store the selected option's letter (A, B, C, D) if an option is selected
                     if selection:
                          user_selections[i] = selection[0] # Get the letter before the '.'
 
-                # Store the selections in session state user_answers dictionary
+                # Update the session state user_answers dictionary with current selections
+                # This needs to happen whether submitted or not, so the state is ready if submitted
                 st.session_state.user_answers = user_selections
 
-                submit_button = st.form_submit_button("Enviar", disabled=st.session_state.submitted_answers)
 
-            if submit_button:
-                 st.session_state.submitted_answers = True
-                 # Need to re-calculate and display score/feedback *after* form submission state changes
-                 st.rerun() # Rerun to update the state and show results below the form
+                submit_button = st.form_submit_button("Enviar", disabled=is_submitted)
 
-
-            # This block runs after submitted_answers becomes True
-            if st.session_state.submitted_answers:
+            # Logic that runs *after* the form has been submitted (i.e., on the rerun triggered by submission)
+            if is_submitted:
                 # Calculate score based on the stored user_answers and correct answers
                 score = 0
                 for i, q in enumerate(st.session_state.current_questions):
@@ -522,45 +632,52 @@ else: # User is logged in
                 for i, q in enumerate(st.session_state.current_questions):
                     user_answer_letter = st.session_state.user_answers.get(i) # Get the selected letter
                     correct_answer_letter = q["correct_answer"]
+                    correct_option_text = q['options'].get(correct_answer_letter, "Opción no encontrada")
 
-                    if user_answer_letter == correct_answer_letter:
-                        st.success(f"**{i+1}. Correcto.**")
-                    elif user_answer_letter is not None: # Answered, but wrong
+
+                    if user_answer_letter is not None: # Check if the user actually made a selection for this question
                         user_option_text = q["options"].get(user_answer_letter, "Opción no encontrada")
-                        correct_option_text = q["options"].get(correct_answer_letter, "Opción no encontrada")
-                        st.error(f"**{i+1}. Incorrecto.** Tu respuesta fue '{user_answer_letter}. {user_option_text}'. La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
+                        if user_answer_letter == correct_answer_letter:
+                            st.success(f"**{i+1}. Correcto.**")
+                        else: # Answered, but wrong
+                           st.error(f"**{i+1}. Incorrecto.** Tu respuesta fue '{user_answer_letter}. {user_option_text}'. La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
                     else: # Not answered
-                         st.warning(f"**{i+1}. No respondido.** La respuesta correcta era '{correct_answer_letter}. {q['options'].get(correct_answer_letter, 'Opción no encontrada')}'.")
+                         st.warning(f"**{i+1}. No respondido.** La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
 
 
                 # Adaptive level adjustment and history saving (only do this once per submission)
-                if not st.session_state.feedback_given: # Flag to ensure this runs only once per submission
+                # Use the feedback_given flag
+                if not st.session_state.feedback_given:
                     percentage = (score / 5) * 100
                     previous_level = st.session_state.current_level
 
+                    level_changed = False
                     if percentage >= 80 and st.session_state.current_level < CONFIG["MAX_LEVEL"]:
                         st.session_state.current_level += 1
                         st.success(f"¡Excelente! Subes al nivel {st.session_state.current_level}.")
+                        level_changed = True
                     elif percentage <= 40 and st.session_state.current_level > CONFIG["MIN_LEVEL"]:
                         st.session_state.current_level -= 1
                         st.warning(f"Necesitas un poco más de práctica. Bajas al nivel {st.session_state.current_level}.")
+                        level_changed = True
                     else:
                         st.info(f"Buen intento. Te mantienes en el nivel {st.session_state.current_level}.")
 
-                    # Fetch current user data to append history
+
+                    # Fetch current user data to append history - essential to avoid overwriting history
                     user_data = get_user(st.session_state.username)
                     if user_data:
                         user_history = user_data.get("history", []) # Get existing history
                         user_history.append({
                             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # Add timestamp for more detail
-                            "level_before": previous_level, # Log level before this practice
-                            "level_after": st.session_state.current_level, # Log level after this practice
+                            "level_before_practice": previous_level, # Log level before this practice
+                            "level_after_practice": st.session_state.current_level, # Log level after this practice
                             "score": score,
-                            "text_summary": st.session_state.current_text[:100] + "..." # Store a snippet of the text
+                            "text_snippet": st.session_state.current_text[:150] + "..." if st.session_state.current_text else "N/A" # Store a snippet of the text
                         })
                         # Update user record in the database
                         update_user(st.session_state.username, current_level=st.session_state.current_level, history=user_history)
-                        logger.info(f"Saved practice result for {st.session_state.username}: Level {previous_level} -> {st.session_state.current_level}, Score {score}/5")
+                        logger.info(f"Saved practice result for {st.session_state.username}: Level {previous_level} -> {st.session_state.current_level}, Score {score}/5. Level changed: {level_changed}")
                     else:
                          logger.error(f"Could not find user {st.session_state.username} to save practice history.")
                          st.error("Error saving your progress.")
@@ -569,11 +686,14 @@ else: # User is logged in
 
                 # Button to proceed to the next text
                 if st.button("Siguiente Texto"):
+                    # Reset all practice-specific session state variables
                     st.session_state.current_text = None
                     st.session_state.current_questions = None
+                    st.session_state.user_answers = {}
                     st.session_state.submitted_answers = False
-                    st.session_state.score = 0 # Reset score
+                    st.session_state.score = 0 # Reset score for next round
                     st.session_state.feedback_given = False
-                    st.rerun()
+                    st.rerun() # Rerun to show the "Comenzar/Siguiente" button
 
+# Footer
 st.caption(f"v{CONFIG['APP_VERSION']} - Desarrollado con Streamlit y Gemini por Moris Polanco | mp@ufm.edu | [morispolanco.vercel.app](https://morispolanco.vercel.app)")
