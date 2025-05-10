@@ -6,8 +6,12 @@ import os
 import time
 import pandas as pd
 import logging
+from logging.handlers import RotatingFileHandler
 import shutil
 from datetime import datetime
+import platform
+import re
+import pickle
 
 # --- Configuration ---
 CONFIG = {
@@ -18,20 +22,24 @@ CONFIG = {
     "WORD_RANGES": {2: "50-80", 4: "80-120", 6: "120-180", 8: "180-250", 10: "250-350"},
     "USER_DATA_FILE": "user_data.json",
     "LOG_FILE": "app.log",
-    "BACKUP_DIR": "backups"
+    "BACKUP_DIR": "backups",
+    "APP_VERSION": "1.2.0",
+    "CACHE_FILE": "text_cache.pkl"
 }
 
 # Load admin credentials from Streamlit secrets
 try:
     ADMIN_USER = st.secrets["ADMIN_USER"]
     ADMIN_PASS = st.secrets["ADMIN_PASS"]
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except KeyError as e:
-    st.error(f"Missing required secret: {e}. Please add it to .streamlit/secrets.toml.")
+    st.error(f"Missing secret: {e}. For local testing, set environment variables or create .streamlit/secrets.toml.")
     st.stop()
 
-# Setup logging
+# Setup logging with rotation
+handler = RotatingFileHandler(CONFIG["LOG_FILE"], maxBytes=10*1024*1024, backupCount=5)
 logging.basicConfig(
-    filename=CONFIG["LOG_FILE"],
+    handlers=[handler],
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -96,7 +104,8 @@ def save_user_data(data):
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         os.replace(temp_file, CONFIG["USER_DATA_FILE"])
-        os.chmod(CONFIG["USER_DATA_FILE"], 0o600)
+        if platform.system() != "Windows":
+            os.chmod(CONFIG["USER_DATA_FILE"], 0o600)
     except Exception as e:
         logger.error(f"Error saving user data: {e}")
         st.error(f"Failed to save data: {e}")
@@ -113,11 +122,27 @@ def restore_from_backup():
             return data
         except Exception as e:
             logger.error(f"Backup restore failed: {e}")
-    return {}
+    logger.warning("No backups found. Initializing with admin.")
+    return load_user_data()  # Forces admin initialization
+
+# --- Cache Functions ---
+def load_cache():
+    try:
+        with open(CONFIG["CACHE_FILE"], 'rb') as f:
+            return pickle.load(f)
+    except:
+        return {}
+
+def save_cache(cache):
+    try:
+        with open(CONFIG["CACHE_FILE"], 'wb') as f:
+            pickle.dump(cache, f)
+    except Exception as e:
+        logger.error(f"Error saving cache: {e}")
 
 # --- Gemini Configuration ---
 try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    genai.configure(api_key=GEMINI_API_KEY)
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -131,6 +156,12 @@ except Exception as e:
 
 # --- Gemini Content Generation ---
 def generate_reading_text(level):
+    cache = load_cache()
+    cache_key = f"level_{level}_{datetime.now().strftime('%Y%m%d')}"
+    if cache_key in cache:
+        logger.info(f"Using cached text for {cache_key}")
+        return cache[cache_key]
+
     difficulty_map = {
         2: ("muy fácil, A1-A2 CEFR", CONFIG["WORD_RANGES"][2], "una descripción simple de un animal"),
         4: ("fácil, A2-B1 CEFR", CONFIG["WORD_RANGES"][4], "una anécdota breve"),
@@ -140,7 +171,6 @@ def generate_reading_text(level):
     }
     difficulty_desc, words, topic = difficulty_map.get(min(level, 10), difficulty_map[10])
 
-    # Add timestamp to prompt for uniqueness
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     prompt = f"""
     Eres un experto en ELE para estudiantes de 16-17 años. Genera un texto en español de nivel {difficulty_desc} ({level}/10), 
@@ -154,9 +184,12 @@ def generate_reading_text(level):
         try:
             response = model.generate_content(prompt)
             text = response.text.strip()
-            if len(text) > 40:
+            if text and len(text.split()) >= 40:
                 logger.info(f"Generated unique text for level {level} at {timestamp}")
+                cache[cache_key] = text
+                save_cache(cache)
                 return text
+            logger.warning(f"Generated text too short or empty on attempt {attempt+1}")
         except Exception as e:
             logger.error(f"Text generation attempt {attempt+1} failed: {e}")
             if attempt < CONFIG["MAX_RETRIES"] - 1:
@@ -183,13 +216,12 @@ def generate_mc_questions(text):
             response = model.generate_content(prompt)
             raw_response = response.text.strip()
             logger.info(f"Raw response from Gemini: {raw_response}")
-            json_text = raw_response.replace("```json", "").replace("```", "").strip()
+            json_text = re.sub(r'^```json\n|```$', '', raw_response, flags=re.MULTILINE).strip()
             questions = json.loads(json_text)
             if isinstance(questions, list) and len(questions) == 5:
                 logger.info("Generated questions successfully")
                 return questions
-            else:
-                logger.error(f"Invalid question format or count: {questions}")
+            logger.error(f"Invalid question format or count: {questions}")
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing failed on attempt {attempt+1}: {e}")
         except Exception as e:
@@ -281,6 +313,7 @@ else:
 
     if st.session_state.is_admin:
         st.title("Panel de Administración")
+        st.warning("Admins cannot access practice mode.")
         students = [{"Email": u, "Nivel": d["level"], "Última Práctica": d["history"][-1]["date"] if d["history"] else "N/A"} 
                     for u, d in user_data.items() if not d.get("is_admin", False)]
         if students:
@@ -313,6 +346,8 @@ else:
                     st.radio(f"**{i+1}. {q['question']}**", options, key=f"q_{i}", disabled=st.session_state.submitted_answers)
                 if st.form_submit_button("Enviar", disabled=st.session_state.submitted_answers):
                     st.session_state.submitted_answers = True
+                    user_data[st.session_state.username]["level"] = st.session_state.current_level
+                    save_user_data(user_data)
                     st.rerun()
 
             if st.session_state.submitted_answers:
@@ -329,7 +364,11 @@ else:
                     st.warning(f"Bajas al nivel {st.session_state.current_level}")
                 
                 user_data[st.session_state.username]["level"] = st.session_state.current_level
-                user_data[st.session_state.username]["history"].append({"date": datetime.now().strftime("%Y-%m-%d"), "level": st.session_state.current_level, "score": score})
+                user_data[st.session_state.username]["history"].append({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "level": st.session_state.current_level,
+                    "score": score
+                })
                 save_user_data(user_data)
 
                 if st.button("Siguiente Texto"):
@@ -338,4 +377,4 @@ else:
                     st.session_state.submitted_answers = False
                     st.rerun()
 
-st.caption("v1.2.0 - Desarrollado con Streamlit y Gemini por Moris Polanco | mp@ufm.edu | [morispolanco.vercel.app](https://morispolanco.vercel.app)")
+st.caption(f"v{CONFIG['APP_VERSION']} - Desarrollado con Streamlit y Gemini por Moris Polanco | mp@ufm.edu | [morispolanco.vercel.app](https://morispolanco.vercel.app)")
