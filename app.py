@@ -24,7 +24,7 @@ CONFIG = {
     "DB_FILE": "user_data.db", # New: SQLite database file
     "LOG_FILE": "app.log",
     "BACKUP_DIR": "backups", # Still keep for DB backups
-    "APP_VERSION": "1.3.3", # Updated version after fixes
+    "APP_VERSION": "1.4.0", # Updated version for new features
     "CACHE_FILE": "text_cache.pkl"
 }
 
@@ -76,8 +76,6 @@ def get_db_connection():
         conn = sqlite3.connect(CONFIG["DB_FILE"])
         conn.row_factory = sqlite3.Row # Allows accessing columns by name
         # Add PRAGMAs for better performance and concurrent read handling (optional but good practice)
-        # Note: For true high concurrency or multi-instance deployment, a
-        # dedicated database server (PostgreSQL, MySQL) is recommended over SQLite.
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
@@ -96,6 +94,7 @@ def init_db():
     try:
         with conn: # Use 'with' for transaction management
             # Corrected CREATE TABLE statement: removed NOT NULL from current_level
+            # This ensures that the table allows NULL values for current_level, which is needed for admins
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY UNIQUE,
@@ -419,6 +418,7 @@ def generate_mc_questions(text):
                  st.error("La generación de preguntas fue bloqueada por el filtro de seguridad.")
                  return None
 
+
             raw_response = response.text.strip()
             logger.info(f"Raw response from Gemini (questions): {raw_response}")
             # Attempt to clean markdown code blocks from the response
@@ -464,7 +464,8 @@ st.sidebar.markdown("""
 default_state = {
     'logged_in': False, 'username': None, 'is_admin': False, 'current_level': CONFIG["DEFAULT_LEVEL"],
     'current_text': None, 'current_questions': None, 'user_answers': {}, 'submitted_answers': False,
-    'score': 0, 'feedback_given': False
+    'score': 0, 'feedback_given': False,
+    'current_view': 'Práctica' # New: Default view
 }
 for key, value in default_state.items():
     if key not in st.session_state:
@@ -501,6 +502,8 @@ if not st.session_state.logged_in:
                     st.session_state.submitted_answers = False
                     st.session_state.score = 0
                     st.session_state.feedback_given = False
+                    st.session_state.current_view = 'Práctica' # Set default view on login
+
                     st.rerun()
                 else:
                     st.error("Credenciales incorrectas.")
@@ -589,186 +592,251 @@ else: # User is logged in
 
 
     else: # User is a student
-        st.title("🚀 Práctica Lectora")
-        st.info(f"Nivel actual: {st.session_state.current_level}")
+        # New: View selection for students
+        st.session_state.current_view = st.radio(
+            "Seleccionar Vista:",
+            ('Práctica', 'Historial'),
+            index=['Práctica', 'Historial'].index(st.session_state.current_view),
+            horizontal=True,
+            key="student_view_selector"
+        )
 
-        # Check if we need to load/generate new content
-        if st.session_state.current_text is None or st.session_state.current_questions is None or not st.session_state.current_questions:
-            # Only show the button to start/continue if no text/questions are loaded or if questions load failed previously
-            # Adjusted button text logic
-            button_text = "Comenzar"
-            if st.session_state.score > 0 or st.session_state.feedback_given:
-                 button_text = "Siguiente"
+        if st.session_state.current_view == 'Práctica':
+            st.title("🚀 Práctica Lectora")
+            st.info(f"Nivel actual: {st.session_state.current_level}")
 
-            if st.button(button_text, type="primary"):
-                # Reset score display and feedback status when requesting new text
-                st.session_state.score = 0
-                st.session_state.feedback_given = False
-                with st.spinner("Preparando un texto interesante…"):
-                    text = generate_reading_text(st.session_state.current_level)
-                    if text:
-                        questions = generate_mc_questions(text)
-                        if questions:
-                            # Reset session state for a new practice round
-                            st.session_state.current_text = text
-                            st.session_state.current_questions = questions
-                            st.session_state.user_answers = {}
-                            st.session_state.submitted_answers = False
-                            st.rerun() # Rerun to display the text and questions
-                        else:
-                             # Clear text if question generation failed, so the button reappears
-                            st.session_state.current_text = None
-                            st.session_state.current_questions = None
-                            st.session_state.user_answers = {} # Also reset user answers state
-                            st.error("No se pudieron generar preguntas para el texto. Inténtalo de nuevo.")
-                    else:
-                         # Clear if text generation failed
-                         st.session_state.current_text = None
-                         st.session_state.current_questions = None
-                         st.session_state.user_answers = {} # Also reset user answers state
-                         st.error("No se pudo generar un texto de lectura. Inténtalo de nuevo.")
+            # --- Visual Level Progress ---
+            # Calculate progress percentage (0 to 1)
+            min_level = CONFIG["MIN_LEVEL"]
+            max_level = CONFIG["MAX_LEVEL"]
+            current_level = st.session_state.current_level
+            # Ensure level is within bounds for calculation
+            display_level = max(min_level, min(max_level, current_level))
+            # Calculate progress: Level 1 is 0%, Level 10 is 100%
+            progress_value = (display_level - min_level) / (max_level - min_level) if max_level > min_level else 0
+
+            st.progress(progress_value, text=f"Progreso Nivel: {display_level}/{max_level}")
+            # --- End Visual Level Progress ---
 
 
-        else: # Text and questions are loaded
-            st.markdown(f"<div style='background-color:#f0f2f6;padding:15px;border-radius:5px;'>{st.session_state.current_text}</div>", unsafe_allow_html=True)
+            # Check if we need to load/generate new content
+            if st.session_state.current_text is None or st.session_state.current_questions is None or not st.session_state.current_questions:
+                # Only show the button to start/continue if no text/questions are loaded or if questions load failed previously
+                # Adjusted button text logic
+                button_text = "Comenzar"
+                if st.session_state.score > 0 or st.session_state.feedback_given:
+                     button_text = "Siguiente"
 
-            st.subheader("Preguntas:")
-            # Use a unique key for the form based on the current text/questions to prevent key errors on rerun with new content
-            form_key = f"qa_form_{hash(st.session_state.current_text + json.dumps(st.session_state.current_questions, sort_keys=True))}" # Use sort_keys for consistent hash
-
-            # Check if form has already been submitted in this session state
-            is_submitted = st.session_state.submitted_answers
-
-            # Use a container to hold the form so subsequent elements appear below it correctly
-            with st.container():
-                with st.form(form_key, clear_on_submit=False): # Use clear_on_submit=False to keep selections visible after submission
-                    # Store user answers keyed by question index
-                    user_selections = {}
-                    for i, q in enumerate(st.session_state.current_questions):
-                        options = [f"{k}. {v}" for k, v in q["options"].items()]
-                        # Use a unique key for each radio button group specific to this form instance
-                        radio_key = f"q_{i}_{form_key}"
-
-                        # Determine default index if answers were previously submitted
-                        default_index = None
-                        if is_submitted and i in st.session_state.user_answers:
-                            try:
-                                # Find the index of the previously selected option string (e.g., "A. Option A")
-                                prev_answer_letter = st.session_state.user_answers[i]
-                                # Ensure prev_answer_letter is one of the valid option keys
-                                if prev_answer_letter in q['options']:
-                                     prev_answer_string_prefix = f"{prev_answer_letter}."
-                                     default_index = next((j for j, opt_str in enumerate(options) if opt_str.startswith(prev_answer_string_prefix)), None)
-                                else:
-                                     logger.warning(f"Invalid previously selected answer letter '{prev_answer_letter}' for question {i}. Not in options.")
-
-                            except Exception as e:
-                                logger.warning(f"Error determining default index for question {i} with answer {st.session_state.user_answers[i]}: {e}")
-
-
-                        selection = st.radio(
-                            f"**{i+1}. {q['question']}**",
-                            options,
-                            index=default_index, # Set default based on submitted answers
-                            key=radio_key, # Ensure unique key per question instance
-                            disabled=is_submitted # Disable if already submitted
-                        )
-                        # Store the selected option's letter (A, B, C, D) if an option is selected
-                        if selection:
-                             user_selections[i] = selection[0] # Get the letter before the '.'
-
-                    # Update the session state user_answers dictionary with current selections
-                    # This happens when the form is interacted with, before submission button logic
-                    # It's important to do this before the submit button logic so the state is correct upon submit
-                    st.session_state.user_answers = user_selections
-
-                    submit_button = st.form_submit_button("Enviar", disabled=is_submitted)
-
-
-            # Logic that runs *after* the form has been submitted (i.e., on the rerun triggered by submission)
-            if is_submitted:
-                # Calculate score based on the stored user_answers and correct answers
-                score = 0
-                # Iterate through the original questions to check against submitted answers
-                for i, q in enumerate(st.session_state.current_questions):
-                    # Check if the user provided an answer for this question index
-                    # And if that answer matches the correct answer letter
-                    if i in st.session_state.user_answers and st.session_state.user_answers[i] == q["correct_answer"]:
-                        score += 1
-
-                st.session_state.score = score # Update score in session state
-
-                st.metric("Puntuación", f"{score}/5")
-
-                # Display feedback for each question
-                st.subheader("Respuestas:")
-                for i, q in enumerate(st.session_state.current_questions):
-                    user_answer_letter = st.session_state.user_answers.get(i) # Get the selected letter by index
-                    correct_answer_letter = q["correct_answer"]
-                    correct_option_text = q['options'].get(correct_answer_letter, "Opción no encontrada")
-
-
-                    if user_answer_letter is not None: # Check if the user actually made a selection for this question
-                        user_option_text = q["options"].get(user_answer_letter, "Opción no encontrada")
-                        if user_answer_letter == correct_answer_letter:
-                            st.success(f"**{i+1}. Correcto.**")
-                        else: # Answered, but wrong
-                           st.error(f"**{i+1}. Incorrecto.** Tu respuesta fue '{user_answer_letter}. {user_option_text}'. La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
-                    else: # Not answered (shouldn't happen with radio buttons unless they are skipped, but good safety)
-                         st.warning(f"**{i+1}. No respondido.** La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
-
-
-                # Adaptive level adjustment and history saving (only do this once per submission)
-                # Use the feedback_given flag
-                if not st.session_state.feedback_given:
-                    percentage = (score / 5) * 100
-                    previous_level = st.session_state.current_level
-
-                    level_changed = False
-                    if percentage >= 80 and st.session_state.current_level < CONFIG["MAX_LEVEL"]:
-                        st.session_state.current_level += 1
-                        st.balloons() # Celebrate level up!
-                        st.success(f"¡Excelente! Subes al nivel {st.session_state.current_level}.")
-                        level_changed = True
-                    elif percentage <= 40 and st.session_state.current_level > CONFIG["MIN_LEVEL"]:
-                        st.session_state.current_level -= 1
-                        st.warning(f"Necesitas un poco más de práctica. Bajas al nivel {st.session_state.current_level}.")
-                        level_changed = True
-                    else:
-                        st.info(f"Buen intento. Te mantienes en el nivel {st.session_state.current_level}.")
-
-
-                    # Fetch current user data to append history - essential to avoid overwriting history
-                    user_data = get_user(st.session_state.username)
-                    if user_data:
-                        user_history = user_data.get("history", []) # Get existing history
-                        user_history.append({
-                            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # Add timestamp for more detail
-                            "level_before_practice": previous_level, # Log level before this practice
-                            "level_after_practice": st.session_state.current_level, # Log level after this practice
-                            "score": score,
-                            "text_snippet": st.session_state.current_text[:150] + "..." if st.session_state.current_text else "N/A" # Store a snippet of the text
-                        })
-                        # Update user record in the database
-                        update_user(st.session_state.username, current_level=st.session_state.current_level, history=user_history)
-                        logger.info(f"Saved practice result for {st.session_state.username}: Level {previous_level} -> {st.session_state.current_level}, Score {score}/5. Level changed: {level_changed}")
-                    else:
-                         logger.error(f"Could not find user {st.session_state.username} to save practice history.")
-                         # st.error("Error saving your progress.") # Might be annoying to show this every time
-
-
-                    st.session_state.feedback_given = True # Mark feedback as given
-
-                # Button to proceed to the next text
-                if st.button("Siguiente Texto"):
-                    # Reset all practice-specific session state variables
-                    st.session_state.current_text = None
-                    st.session_state.current_questions = None
-                    st.session_state.user_answers = {}
-                    st.session_state.submitted_answers = False
-                    st.session_state.score = 0 # Reset score for next round
+                if st.button(button_text, type="primary"):
+                    # Reset score display and feedback status when requesting new text
+                    st.session_state.score = 0
                     st.session_state.feedback_given = False
-                    st.rerun() # Rerun to show the "Comenzar/Siguiente" button
+                    with st.spinner("Preparando un texto interesante…"):
+                        text = generate_reading_text(st.session_state.current_level)
+                        if text:
+                            questions = generate_mc_questions(text)
+                            if questions:
+                                # Reset session state for a new practice round
+                                st.session_state.current_text = text
+                                st.session_state.current_questions = questions
+                                st.session_state.user_answers = {}
+                                st.session_state.submitted_answers = False
+                                st.rerun() # Rerun to display the text and questions
+                            else:
+                                 # Clear text if question generation failed, so the button reappears
+                                st.session_state.current_text = None
+                                st.session_state.current_questions = None
+                                st.session_state.user_answers = {} # Also reset user answers state
+                                st.error("No se pudieron generar preguntas para el texto. Inténtalo de nuevo.")
+                        else:
+                             # Clear if text generation failed
+                             st.session_state.current_text = None
+                             st.session_state.current_questions = None
+                             st.session_state.user_answers = {} # Also reset user answers state
+                             st.error("No se pudo generar un texto de lectura. Inténtalo de nuevo.")
+
+
+            else: # Text and questions are loaded
+                st.markdown(f"<div style='background-color:#f0f2f6;padding:15px;border-radius:5px;'>{st.session_state.current_text}</div>", unsafe_allow_html=True)
+
+                st.subheader("Preguntas:")
+                # Use a unique key for the form based on the current text/questions to prevent key errors on rerun with new content
+                form_key = f"qa_form_{hash(st.session_state.current_text + json.dumps(st.session_state.current_questions, sort_keys=True))}" # Use sort_keys for consistent hash
+
+                # Check if form has already been submitted in this session state
+                is_submitted = st.session_state.submitted_answers
+
+                # Use a container to hold the form so subsequent elements appear below it correctly
+                with st.container():
+                    with st.form(form_key, clear_on_submit=False): # Use clear_on_submit=False to keep selections visible after submission
+                        # Store user answers keyed by question index
+                        user_selections = {}
+                        for i, q in enumerate(st.session_state.current_questions):
+                            options = [f"{k}. {v}" for k, v in q["options"].items()]
+                            # Use a unique key for each radio button group specific to this form instance
+                            radio_key = f"q_{i}_{form_key}"
+
+                            # Determine default index if answers were previously submitted
+                            default_index = None
+                            if is_submitted and i in st.session_state.user_answers:
+                                try:
+                                    # Find the index of the previously selected option string (e.g., "A. Option A")
+                                    prev_answer_letter = st.session_state.user_answers[i]
+                                    # Ensure prev_answer_letter is one of the valid option keys
+                                    if prev_answer_letter in q['options']:
+                                         prev_answer_string_prefix = f"{prev_answer_letter}."
+                                         default_index = next((j for j, opt_str in enumerate(options) if opt_str.startswith(prev_answer_string_prefix)), None)
+                                    else:
+                                         logger.warning(f"Invalid previously selected answer letter '{prev_answer_letter}' for question {i}. Not in options.")
+
+                                except Exception as e:
+                                    logger.warning(f"Error determining default index for question {i} with answer {st.session_state.user_answers[i]}: {e}")
+
+
+                            selection = st.radio(
+                                f"**{i+1}. {q['question']}**",
+                                options,
+                                index=default_index, # Set default based on submitted answers
+                                key=radio_key, # Ensure unique key per question instance
+                                disabled=is_submitted # Disable if already submitted
+                            )
+                            # Store the selected option's letter (A, B, C, D) if an option is selected
+                            if selection:
+                                 user_selections[i] = selection[0] # Get the letter before the '.'
+
+                        # Update the session state user_answers dictionary with current selections
+                        # This happens when the form is interacted with, before submission button logic
+                        # It's important to do this before the submit button logic so the state is correct upon submit
+                        st.session_state.user_answers = user_selections
+
+                        submit_button = st.form_submit_button("Enviar", disabled=is_submitted)
+
+
+                # Logic that runs *after* the form has been submitted (i.e., on the rerun triggered by submission)
+                if is_submitted:
+                    # Calculate score based on the stored user_answers and correct answers
+                    score = 0
+                    # Iterate through the original questions to check against submitted answers
+                    for i, q in enumerate(st.session_state.current_questions):
+                        # Check if the user provided an answer for this question index
+                        # And if that answer matches the correct answer letter
+                        if i in st.session_state.user_answers and st.session_state.user_answers[i] == q["correct_answer"]:
+                            score += 1
+
+                    st.session_state.score = score # Update score in session state
+
+                    st.metric("Puntuación", f"{score}/5")
+
+                    # --- Display Feedback (Correct Answers) ---
+                    st.subheader("Respuestas:")
+                    for i, q in enumerate(st.session_state.current_questions):
+                        user_answer_letter = st.session_state.user_answers.get(i) # Get the selected letter by index
+                        correct_answer_letter = q["correct_answer"]
+                        correct_option_text = q['options'].get(correct_answer_letter, "Opción no encontrada")
+
+                        if user_answer_letter is not None: # Check if the user actually made a selection for this question
+                            user_option_text = q["options"].get(user_answer_letter, "Opción no encontrada")
+                            if user_answer_letter == correct_answer_letter:
+                                st.success(f"**{i+1}. Correcto.**")
+                            else: # Answered, but wrong
+                               st.error(f"**{i+1}. Incorrecto.** Tu respuesta fue '{user_answer_letter}. {user_option_text}'. La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
+                        else: # Not answered (shouldn't happen with radio buttons unless they are skipped, but good safety)
+                             st.warning(f"**{i+1}. No respondido.** La respuesta correcta era '{correct_answer_letter}. {correct_option_text}'.")
+                    # --- End Display Feedback ---
+
+
+                    # Adaptive level adjustment and history saving (only do this once per submission)
+                    # Use the feedback_given flag
+                    if not st.session_state.feedback_given:
+                        percentage = (score / 5) * 100
+                        previous_level = st.session_state.current_level
+
+                        level_changed = False
+                        if percentage >= 80 and st.session_state.current_level < CONFIG["MAX_LEVEL"]:
+                            st.session_state.current_level += 1
+                            st.balloons() # Celebrate level up!
+                            st.success(f"¡Excelente! Subes al nivel {st.session_state.current_level}.")
+                            level_changed = True
+                        elif percentage <= 40 and st.session_state.current_level > CONFIG["MIN_LEVEL"]:
+                            st.session_state.current_level -= 1
+                            st.warning(f"Necesitas un poco más de práctica. Bajas al nivel {st.session_state.current_level}.")
+                            level_changed = True
+                        else:
+                            st.info(f"Buen intento. Te mantienes en el nivel {st.session_state.current_level}.")
+
+
+                        # Fetch current user data to append history - essential to avoid overwriting history
+                        user_data = get_user(st.session_state.username)
+                        if user_data:
+                            user_history = user_data.get("history", []) # Get existing history
+                            user_history.append({
+                                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # Add timestamp for more detail
+                                "level_before_practice": previous_level, # Log level before this practice
+                                "level_after_practice": st.session_state.current_level, # Log level after this practice
+                                "score": score,
+                                "text_snippet": st.session_state.current_text[:150] + "..." if st.session_state.current_text else "N/A" # Store a snippet of the text
+                            })
+                            # Update user record in the database
+                            update_user(st.session_state.username, current_level=st.session_state.current_level, history=user_history)
+                            logger.info(f"Saved practice result for {st.session_state.username}: Level {previous_level} -> {st.session_state.current_level}, Score {score}/5. Level changed: {level_changed}")
+                        else:
+                             logger.error(f"Could not find user {st.session_state.username} to save practice history.")
+                             # st.error("Error saving your progress.") # Might be annoying to show this every time
+
+
+                        st.session_state.feedback_given = True # Mark feedback as given
+
+                    # Button to proceed to the next text
+                    if st.button("Siguiente Texto"):
+                        # Reset all practice-specific session state variables
+                        st.session_state.current_text = None
+                        st.session_state.current_questions = None
+                        st.session_state.user_answers = {}
+                        st.session_state.submitted_answers = False
+                        st.session_state.score = 0 # Reset score for next round
+                        st.session_state.feedback_given = False
+                        st.rerun() # Rerun to show the "Comenzar/Siguiente" button
+
+
+        elif st.session_state.current_view == 'Historial':
+            st.title("📚 Historial de Práctica")
+            st.info(f"Usuario: {st.session_state.username}")
+
+            user_data = get_user(st.session_state.username)
+            if user_data and user_data.get('history'):
+                history = user_data['history']
+                st.subheader("Sesiones Anteriores:")
+
+                # Convert history list of dicts to DataFrame
+                df_history = pd.DataFrame(history)
+
+                # Rename columns for better display
+                df_history = df_history.rename(columns={
+                    'date': 'Fecha y Hora',
+                    'level_before_practice': 'Nivel Antes',
+                    'level_after_practice': 'Nivel Después',
+                    'score': 'Puntuación (5)'
+                })
+
+                # Reorder columns for display if desired
+                display_cols = ['Fecha y Hora', 'Nivel Antes', 'Nivel Después', 'Puntuación (5)', 'text_snippet']
+                df_history = df_history[display_cols]
+
+                # Display the DataFrame
+                st.dataframe(df_history)
+
+                # Optional: Download history as CSV
+                csv_data = df_history.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Descargar Historial (CSV)",
+                    data=csv_data,
+                    file_name=f"historial_practica_{st.session_state.username}.csv",
+                    mime="text/csv",
+                )
+
+            else:
+                st.info("Aún no tienes historial de práctica. ¡Comienza una sesión en la vista 'Práctica'!")
+
 
 # Footer
 st.caption(f"v{CONFIG['APP_VERSION']} - Desarrollado con Streamlit y Gemini por Moris Polanco | mp@ufm.edu | [morispolanco.vercel.app](https://morispolanco.vercel.app)")
